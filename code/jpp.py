@@ -33,6 +33,13 @@ import matplotlib.pyplot as plt
 import matplotlib as mpl
 
 
+##### TT custom #####
+from photutils.psf import EPSFBuilder
+from astropy.nddata import NDData
+from astropy.visualization import simple_norm
+from photutils.psf import extract_stars
+import scipy.spatial as sp
+
 ### DEFINITIONS #####
 
 def get_diffraction_limit_psf_fwhm(lam):
@@ -91,10 +98,11 @@ def getImageProperties(imgpath,hduext):
             hduextnbr = np.where(hduext == extlist)[0][0] + 1 # because we cut the PRIMARY since it doesn't have an EXTNAME
                 
     ## Compute zeropoint
-    zp = -2.5*np.log10(23.5045 * hdr["PIXAR_A2"]) + 23.9
+    zp = -2.5*np.log10(23.5045 * ((hdr['CD1_1']**2+hdr['CD1_2']**2)**0.5*3600)**2) + 23.9
+    print("pixel scale in arcsec", (hdr['CD1_1']**2+hdr['CD1_2']**2)**0.5*3600)
     
     ## Return
-    return(zp , hduextnbr, np.sqrt(hdr["PIXAR_A2"]) , hdr_wcs)
+    return(zp , hduextnbr, np.sqrt(((hdr['CD1_1']**2+hdr['CD1_2']**2)**0.5*3600)**2) , hdr_wcs)
 
 
 def create_circular_mask(h, w, center=None, radius=None):
@@ -171,7 +179,7 @@ def runsextractor(imgpath , hduextnbr, call, def_paths, def_pars):
     sex_cat_output_path = os.path.join(def_paths["output"] , sex_cat_output_name)
 
 
-    cmd = "{} {}[{}] -c {} -CATALOG_NAME {}  -PARAMETERS_NAME {} -FILTER_NAME {} -STARNNW_NAME {}  -DETECT_THRESH {} -MAG_ZEROPOINT {} -PIXEL_SCALE {} -SEEING_FWHM {}".format(
+    cmd = "{} {}[{}] -c {} -CATALOG_NAME {}  -PARAMETERS_NAME {} -FILTER_NAME {} -STARNNW_NAME {}  -DETECT_THRESH {} -MAG_ZEROPOINT {} -PIXEL_SCALE {} -SEEING_FWHM {} -PHOT_APERTURES {}".format(
         call,
         imgpath,
         hduextnbr,
@@ -183,7 +191,8 @@ def runsextractor(imgpath , hduextnbr, call, def_paths, def_pars):
         def_pars["DETECT_THRESH"],
         def_pars["MAG_ZEROPOINT"],
         def_pars["PIXEL_SCALE"],
-        def_pars["SEEING_FWHM"]
+        def_pars["SEEING_FWHM"],
+        def_pars["PHOT_APERTURES"]
     )
     print(cmd)
 
@@ -196,7 +205,7 @@ def runsextractor(imgpath , hduextnbr, call, def_paths, def_pars):
             }
     )
 
-def select_stars_constant(cat , mag_range_fit , re_range_percent, class_star_limit, lam, pixscale, output_path , MAKEPLOT):
+def select_stars_constant(cat , mag_range_fit , re_range_percent, class_star_limit, pixscale, output_path , MAKEPLOT, L=1, sn=200, psf_fwhm_guess = False):
     '''
     Selects stars from a SExtractor catalog according to a perfectly
     horizontal stellar locus. This is a VERY SIMPLE extraction method.
@@ -243,22 +252,29 @@ def select_stars_constant(cat , mag_range_fit , re_range_percent, class_star_lim
     # - https://jwst-docs.stsci.edu/jwst-mid-infrared-instrument/miri-performance/miri-point-spread-functions
     # Note that in theory we also have to take into account the pixel size. However,
     # usually the pixel size is comparable or smaller than the JWST PSF size (=1).
-    psf_fwhm_guess = get_diffraction_limit_psf_fwhm(lam = lam)
+    #if psf_fwhm_guess == False: #TT
+    #    psf_fwhm_guess = get_diffraction_limit_psf_fwhm(lam = lam)
+    #else:
+    psf_fwhm_guess = psf_fwhm_guess
+    
     fwhm_to_re = 0.5 # For a Gaussian, Re = FWHM*0.5 (for King profile it's 0.7)
-    psf_re_total_pixel = np.sqrt( (psf_fwhm_guess/pixscale * fwhm_to_re)**2 + (1)**2 )
-    print("RE SELECTION (px):" , psf_re_total_pixel.value)
+    psf_re_total_pixel = np.sqrt((psf_fwhm_guess/pixscale * fwhm_to_re)**2 + (1)**2 )
+    print("RE SELECTION (px):" , psf_re_total_pixel)
 
     ## get data
     X = cat["MAG_AUTO"]
     Y = cat["FLUX_RADIUS"]
-
+    
     ## Do initial selection. This includes candidate stars that are within
     # a range from a diffraction limited PSF.
     sel_stars1 =  np.where( (cat["CLASS_STAR"] > class_star_limit) 
                     & (cat["MAG_AUTO"] > mag_range_fit[0])
                     & (cat["MAG_AUTO"] < mag_range_fit[1])
-                    & (cat["FLUX_RADIUS"] >= (psf_re_total_pixel.value - 2*re_range_percent[0]/100*psf_re_total_pixel.value))
-                    & (cat["FLUX_RADIUS"] <= (psf_re_total_pixel.value + 2*re_range_percent[0]/100*psf_re_total_pixel.value))
+                    & (cat["FLAGS"] < 2)
+                    & (cat["ELONGATION"] < 1.5)
+                    & (cat["FLUX_APER"]/cat["FLUXERR_APER"] > sn)
+                    & (cat["FLUX_RADIUS"] >= (psf_re_total_pixel - 2*re_range_percent[0]/100*psf_re_total_pixel))
+                    & (cat["FLUX_RADIUS"] <= (psf_re_total_pixel + 2*re_range_percent[0]/100*psf_re_total_pixel))
                     )[0]
     Xstars1 = X[sel_stars1]
     Ystars1 = Y[sel_stars1]
@@ -269,10 +285,27 @@ def select_stars_constant(cat , mag_range_fit , re_range_percent, class_star_lim
     # selected magnitude range.
     re_med = np.median(Ystars1)
 
+    # filter out stars that has brighter neighbor within distance L arcsec 
+    coordinates = np.vstack((cat["X_IMAGE"],cat["Y_IMAGE"])).T
+    KDT = sp.cKDTree(coordinates, leafsize=16, compact_nodes=True, copy_data=True, balanced_tree=True, boxsize=None)
+    distances, indices = KDT.query(coordinates, k=2)
+    include = np.ones_like(cat["MAG_AUTO"], dtype=bool)
+    for i in range(len(cat["MAG_AUTO"])):
+    # Check if the nearest neighbor (excluding the star itself) is within distance L (arcsec)
+        if distances[i, 1] < L/pixscale:
+            # Check if the nearest neighbor is brighter (has a lower z value)
+            if cat["MAG_AUTO"][indices[i, 1]] < cat["MAG_AUTO"][i]:
+                include[i] = False
+    print('how many stars are filtered out with the neighbor condition', len(include)-np.sum(include),'/',len(include))
+    print('how many stars are filtered out with the condition SN>', sn, np.sum(cat["FLUX_APER"]/cat["FLUXERR_APER"] < sn), '/', len(include))
     ## Final selection:
     sel_stars2 = np.where( (cat["CLASS_STAR"] > class_star_limit) 
                     & (cat["MAG_AUTO"] > mag_range_fit[0])
                     & (cat["MAG_AUTO"] < mag_range_fit[1])
+                    & (cat["FLAGS"] < 2)
+                    & (cat["ELONGATION"] < 1.5)
+                    & (cat["FLUX_APER"]/cat["FLUXERR_APER"] > sn)
+                    & (include)
                     & (cat["FLUX_RADIUS"] >= (re_med - re_range_percent[0]/100*re_med))
                     & (cat["FLUX_RADIUS"] <= (re_med + re_range_percent[0]/100*re_med))
                     )[0]
@@ -291,7 +324,7 @@ def select_stars_constant(cat , mag_range_fit , re_range_percent, class_star_lim
         Y = cat["FLUX_RADIUS"]
         
         ax1.plot(X , Y , "o" , markersize=2 , color="lightgray" , alpha=0.5 , label="All detections")
-        ax1.plot(X[sel_stars1] , Y[sel_stars1] , "o" , markersize=2 , color="gray" , alpha=0.8 , label="Candidate Stars")
+        ax1.plot(X[sel_stars1] , Y[sel_stars1] , "o" , markersize=2 , color="gray" , alpha=0.8 , label=f"Candidate Stars({mag_range_fit[0]:.1f} to {mag_range_fit[1]:.1f} mag)")
         ax1.plot(X[sel_stars2] , Y[sel_stars2] , "x" , markersize=3 , color="red" , alpha=1 , label="Final Selection")
         ax1.axhline(y = psf_re_total_pixel , linewidth=1 , linestyle="--" , color="black")
 
@@ -306,7 +339,7 @@ def select_stars_constant(cat , mag_range_fit , re_range_percent, class_star_lim
         ax1.set_yscale("log")
         ax1.set_xlabel("Magnitude (AB)")
         ax1.set_ylabel(r"$R_e$")
-
+        #plt.show()
         plt.savefig(os.path.join(output_path , "starselection.pdf"),bbox_inches="tight")
         plt.close()
 
@@ -377,13 +410,16 @@ def StarsCutout(cat , imgpath, hduext , cutout_size_arcsec , ra_name , dec_name)
         hdr = hdul[hduext].header
         this_wcs = WCS(hdul[hduext].header)
 
-        pixscale = hdr["CDELT1"]*3600
+        pixscale = (hdr['CD1_1']**2+hdr['CD1_2']**2)**0.5*3600 # TT
+        print("pixel scale in arcsec", (hdr['CD1_1']**2+hdr['CD1_2']**2)**0.5*3600)
 
-        cutout_size_px = int( cutout_size_arcsec.to(u.arcsec).value / pixscale) * u.pixel
+        cutout_size_px = int( cutout_size_arcsec.to(u.arcsec).value / pixscale) 
+        # Ensure cutout_size_px is odd
+        if cutout_size_px % 2 == 0:
+            cutout_size_px += 1
+        cutout_size_px = cutout_size_px
+        print('default raw star cutout size: ', cutout_size_px)
 
-        if cutout_size_px.value % 2 == 0.0:
-            cutout_size_px = cutout_size_px + 1*u.pixel
-        
         for ii,star in enumerate(cat):
             
             #print("Cutting star ID={} at RA={}, DEC={}".format(star["NUMBER"],star["ALPHA_J2000"],star["DELTA_J2000"]))
@@ -395,6 +431,79 @@ def StarsCutout(cat , imgpath, hduext , cutout_size_arcsec , ra_name , dec_name)
             STARS.append(cutout)
 
     return(STARS)
+
+
+def StarsCutout_photutils(cat , imgpath, hduext , cutout_size_arcsec):
+    """ read stellar images compatible for photutils epsf builder
+    """
+    with fits.open(imgpath) as hdul:
+        hdr = hdul[hduext].header
+        nddata = NDData(data=hdul[hduext].data)
+    
+        pixscale = (hdr['CD1_1']**2+hdr['CD1_2']**2)**0.5*3600
+        cutout_size_px = int( cutout_size_arcsec.to(u.arcsec).value / pixscale)
+        if cutout_size_px % 2 == 0:
+            cutout_size_px += 1
+        print('photoutil raw star cutout size: ', cutout_size_px)
+        # create table of star positions (probably redundant)
+        stars_tbl = Table()
+        stars_tbl['x'] = cat['X_IMAGE']
+        stars_tbl['y'] = cat['Y_IMAGE']
+        # create cutouts
+        stars = extract_stars(nddata, stars_tbl, size=cutout_size_px)
+        print('actual photoutil star image shape',stars[0].shape)
+    return(stars)
+
+def trim_axs(axs, N):
+    """little helper to massage the axs list to have correct length..."""
+    axs = axs.flat
+    for ax in axs[N:]:
+        ax.remove()
+    return axs[:N]
+
+def createPSF_photutils(stars, output_path , psf_name, cut_pix, MAKEPLOT, oversampling = 2, maxiters = 3, shape = None):
+    """
+    Creates the final PSF by centering and stacking the stars.
+    """
+    # plot stars for visual inspection
+    if MAKEPLOT:
+        nrows = 14
+        ncols = 10
+        fig, ax = plt.subplots(nrows=nrows, ncols=ncols, figsize=(8.27, 11.69),
+                        squeeze=True)
+        axs = trim_axs(ax, len(stars))
+        for i, ax in enumerate(axs):
+            norm = simple_norm(stars[i], 'log', percent=99.0)
+            ax.imshow(stars[i], norm=norm, origin='lower', cmap='viridis')
+        #plt.show()
+        plt.savefig(os.path.join(output_path ,psf_name.replace(".fits","_psf_stars.pdf")),bbox_inches="tight")
+        plt.close()
+    print(type(stars))
+    epsf_builder = EPSFBuilder(oversampling=oversampling, maxiters=maxiters,
+                           progress_bar=False)
+    epsf, fitted_stars = epsf_builder(stars)
+    print('PSF shape before cut: ', epsf.data.shape)
+    
+    #if oversampling > 1:
+    #    epsf = epsf.data.reshape((epsf.data.shape[0]//oversampling, oversampling, epsf.data.shape[0]//oversampling, oversampling))
+    #else:
+    #    
+    epsf = epsf._data
+    
+    # cut the epsf to have the same size as the PSF 
+    #cut_pix = int((epsf.shape[0]-(shape[0]*oversampling+1))/2) 
+    epsf = epsf[int(cut_pix*oversampling):(epsf.shape[0]-int(cut_pix*oversampling)+0) , int(cut_pix*oversampling):(epsf.shape[1]-int(cut_pix*oversampling)+0) ]
+    epsf = epsf / np.nansum(epsf)
+    print('PSF shape after cut: ', epsf.shape)
+    # plot epsf
+    if MAKEPLOT:
+        fig, ax = plt.subplots(figsize=(5, 5))
+        norm = simple_norm(epsf, 'log', percent=99.0)
+        ax.imshow(epsf, norm=norm, origin='lower', cmap='viridis')
+        plt.savefig(os.path.join(output_path ,psf_name.replace(".fits","_epsf.pdf")),bbox_inches="tight")
+        plt.close()
+
+    return(epsf)
 
 
 def createPSF(stars , mask_radius_arcsec , pixscale , output_path , psf_name , cut_pix , MAKEPLOT):
@@ -440,11 +549,12 @@ def createPSF(stars , mask_radius_arcsec , pixscale , output_path , psf_name , c
         STARS_SHIFT.append( star_shift ) # shift
         
     ## Stack the shifted stars
-    PSF = np.nanmedian( STARS_SHIFT , axis=0 ) # stack
+    PSF = np.nanmedian(STARS_SHIFT , axis=0 ) # stack
 
     ## Cut the ugly edges introduced by shifting the images
+    print('PSF shape before cut: ', PSF.shape)
     PSF = PSF[int(cut_pix):(PSF.shape[0]-int(cut_pix)+0)  , int(cut_pix):(PSF.shape[1]-int(cut_pix)+0) ]
-
+    print('PSF shape after cut: ', PSF.shape)
     ## Normalize to 1
     PSF = PSF / np.nansum(PSF) # normalize
 
@@ -467,7 +577,7 @@ def createPSF(stars , mask_radius_arcsec , pixscale , output_path , psf_name , c
 
         ax1.set_xlabel(r"x [px]")
         ax1.set_ylabel(r"y [px]")
-
+        
         plt.savefig(os.path.join(output_path ,psf_name.replace(".fits",".pdf")),bbox_inches="tight")
         plt.close()
 
@@ -545,8 +655,8 @@ def jpp(image_pars , general_paths , sextractor_pars , starselection_pars , psf_
     image_pars["wcs"] = hdr_wcs
     sextractor_pars["def_pars"]["MAG_ZEROPOINT"] = zp
     sextractor_pars["def_pars"]["PIXEL_SCALE"] = pixscale
-    sextractor_pars["def_pars"]["SEEING_FWHM"] = get_diffraction_limit_psf_fwhm(image_pars["lam"])
-
+    sextractor_pars["def_pars"]["SEEING_FWHM"] = image_pars["SEEING_FWHM"] #get_diffraction_limit_psf_fwhm(image_pars["lam"])
+    sextractor_pars["def_pars"]["PHOT_APERTURES"] = image_pars["PHOT_APERTURES"]/pixscale # 5 arcsec aperture in pixels
     ## First create SExtractor catalog =============
     if "SEXTRACTOR" in run_list:
         s_results = runsextractor(imgpath=image_pars["imgpath"],
@@ -568,13 +678,16 @@ def jpp(image_pars , general_paths , sextractor_pars , starselection_pars , psf_
 
     ## Select Stars =============
     if "STARSELECT" in run_list:
+        print('seeing guess for filter'+image_pars["filter"]+" ", image_pars["SEEING_FWHM"], "arcsec (FWHM)")
         scat_stars = select_stars_constant(cat=scat, mag_range_fit=starselection_pars["mag_range_fit"],
             re_range_percent=starselection_pars["re_range_percent"] ,
             class_star_limit = starselection_pars["class_star_limit"],
-            lam = image_pars["lam"],
             pixscale = image_pars["pixscale"],
             output_path = general_paths["main_output"],
-            MAKEPLOT = starselection_pars["makeplot"]
+            MAKEPLOT = starselection_pars["makeplot"],
+            L = starselection_pars["separation"],
+            sn = starselection_pars["SN"],
+            psf_fwhm_guess = image_pars["SEEING_FWHM"]
         )
         print("{} Stars found!".format(len(scat_stars)))
     else:
@@ -618,6 +731,25 @@ def jpp(image_pars , general_paths , sextractor_pars , starselection_pars , psf_
                         cut_pix = psf_pars["cut_pix"],
                         MAKEPLOT = psf_pars["makeplot"]
                         )
+        print(PSF.shape, PSF.sum(), psf_pars["cut_pix"])
+        ## Create PSF with EPSFBuilder ================
+        STARS = StarsCutout_photutils( cat = scat_stars,
+                            imgpath = image_pars["imgpath"],
+                            hduext = image_pars["hduext"],
+                            cutout_size_arcsec = psf_pars["cutout_size_arcsec"]
+                            )
+        
+        EPSF = createPSF_photutils( stars = STARS,
+                        output_path = general_paths["main_output"],
+                        psf_name = general_paths["psf_name"],
+                        cut_pix = psf_pars["cut_pix"],
+                        MAKEPLOT = psf_pars["makeplot"],
+                        maxiters = psf_pars["maxiters"],
+                        oversampling = psf_pars["oversampling"],
+                        shape = PSF.shape
+                        )
+        print(EPSF.shape, EPSF.sum(), psf_pars["cut_pix"])
 
     t2 = time.time()
     print("All Done in {:.2f} minutes".format( (t2-t1)/60 ))
+    return(PSF, EPSF)
